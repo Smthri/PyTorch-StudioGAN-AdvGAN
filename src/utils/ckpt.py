@@ -12,10 +12,7 @@ import torch
 import numpy as np
 
 import utils.log as log
-try:
-    import utils.misc as misc
-except AttributeError:
-    pass
+import utils.misc as misc
 
 blacklist = ["CCMGAN2048-train-2021_06_22_06_11_37"]
 
@@ -27,7 +24,7 @@ def make_ckpt_dir(ckpt_dir):
 
 
 def load_ckpt(model, optimizer, ckpt_path, load_model=False, load_opt=False, load_misc=False, is_freezeD=False):
-    ckpt = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
+    ckpt = torch.load(ckpt_path)
     if load_model:
         if is_freezeD:
             mismatch_names = misc.load_parameters(src=ckpt["state_dict"],
@@ -48,10 +45,7 @@ def load_ckpt(model, optimizer, ckpt_path, load_model=False, load_opt=False, loa
         seed = ckpt["seed"]
         run_name = ckpt["run_name"]
         step = ckpt["step"]
-        try:
-            aa_p = ckpt["aa_p"]
-        except:
-            aa_p = ckpt["ada_p"]
+        ada_p = ckpt["ada_p"]
         best_step = ckpt["best_step"]
         best_fid = ckpt["best_fid"]
 
@@ -67,36 +61,33 @@ def load_ckpt(model, optimizer, ckpt_path, load_model=False, load_opt=False, loa
             best_ckpt_path = ckpt["best_fid_checkpoint_path"]
         except:
             best_ckpt_path = ckpt["best_fid_ckpt"]
-        return seed, run_name, step, epoch, topk, aa_p, best_step, best_fid, best_ckpt_path
+        return seed, run_name, step, epoch, topk, ada_p, best_step, best_fid, best_ckpt_path
 
 
 def load_StudioGAN_ckpts(ckpt_dir, load_best, Gen, Dis, g_optimizer, d_optimizer, run_name, apply_g_ema, Gen_ema, ema,
-                         is_train, RUN, logger, global_rank, device, cfg_file):
+                         is_train, RUN, logger, global_rank, device):
     when = "best" if load_best is True else "current"
     Gen_ckpt_path = glob.glob(join(ckpt_dir, "model=G-{when}-weights-step*.pth".format(when=when)))[0]
     Dis_ckpt_path = glob.glob(join(ckpt_dir, "model=D-{when}-weights-step*.pth".format(when=when)))[0]
-    prev_run_name = torch.load(Dis_ckpt_path, map_location=lambda storage, loc: storage)["run_name"]
+    prev_run_name = torch.load(Dis_ckpt_path)["run_name"]
     is_freezeD = True if RUN.freezeD > -1 else False
 
     load_ckpt(model=Gen,
               optimizer=g_optimizer,
               ckpt_path=Gen_ckpt_path,
               load_model=True,
-              load_opt=False if prev_run_name in blacklist or is_freezeD or not is_train else True,
+              load_opt=False if prev_run_name in blacklist or is_freezeD else True,
               load_misc=False,
               is_freezeD=is_freezeD)
 
-    seed, prev_run_name, step, epoch, topk, aa_p, best_step, best_fid, best_ckpt_path =\
+    seed, prev_run_name, step, epoch, topk, ada_p, best_step, best_fid, best_ckpt_path =\
         load_ckpt(model=Dis,
                   optimizer=d_optimizer,
                   ckpt_path=Dis_ckpt_path,
                   load_model=True,
-                  load_opt=False if prev_run_name in blacklist or is_freezeD or not is_train else True,
+                  load_opt=False if prev_run_name in blacklist or is_freezeD else True,
                   load_misc=True,
                   is_freezeD=is_freezeD)
-
-    if not is_train:
-        prev_run_name = cfg_file[cfg_file.rindex("/")+1:cfg_file.index(".yaml")]+prev_run_name[prev_run_name.index("-train"):]
 
     if apply_g_ema:
         Gen_ema_ckpt_path = glob.glob(join(ckpt_dir, "model=G_ema-{when}-weights-step*.pth".format(when=when)))[0]
@@ -124,9 +115,9 @@ def load_StudioGAN_ckpts(ckpt_dir, load_best, Gen, Dis, g_optimizer, d_optimizer
         logger.info("Discriminator checkpoint is {}".format(Dis_ckpt_path))
 
     if is_freezeD:
-        prev_run_name, step, epoch, topk, aa_p, best_step, best_fid, best_ckpt_path =\
+        prev_run_name, step, epoch, topk, ada_p, best_step, best_fid, best_ckpt_path = \
             run_name, 0, 0, "initialize", None, 0, None, None
-    return prev_run_name, step, epoch, topk, aa_p, best_step, best_fid, best_ckpt_path, logger
+    return prev_run_name, step, epoch, topk, ada_p, best_step, best_fid, best_ckpt_path, logger
 
 
 def load_best_model(ckpt_dir, Gen, Dis, apply_g_ema, Gen_ema, ema):
@@ -185,7 +176,7 @@ def check_is_pre_trained_model(ckpt_dir, GAN_train, GAN_test):
 
 def load_GAN_train_test_model(model, mode, optimizer, RUN):
     ckpt_path = join(RUN.ckpt_dir, "model=C-{mode}-best-weights.pth".format(mode=mode))
-    ckpt = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
+    ckpt = torch.load(ckpt_path)
 
     model.load_state_dict(ckpt["state_dict"])
     optimizer.load_state_dict(ckpt["optimizer"])

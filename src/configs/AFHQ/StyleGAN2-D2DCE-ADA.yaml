@@ -1,3 +1,16 @@
+# Guidelines for StyleGAN2-D2DCE-ADA config
+# g_cond_mtd can be changed btw ["W/O", "cAdaIN"]
+# d_cond_mtd can be changed btw ["W/O", "AC", "PD", "MH", "MD", "2C", "D2DCE", "SPD"]
+# z_dim, w_dim should be fixed to 512 regardless of image size.
+# apply_g_ema should be true for stable results.
+# apply_r1_reg should be true.
+# g_reg_interval, d_reg_interval is fixed to 4, 16 regardless of image size.
+# pl_reg is disabled only for cifar10.
+# d_architecture is 'orig' for cifar10.
+# style_mixing_p should be 0.9 for all settings except for cifar10 (0)
+# for total_step, batch_size, d_epilogue_mbstd_group_size, g/d_lr, r1_lambda, g_ema_kimg
+# g_ema_rampup, mapping_network, check StyleGAN2 section in src/config.py
+
 DATA:
   name: "AFHQ"
   img_size: 512
@@ -23,7 +36,6 @@ LOSS:
   temperature: 0.5
   apply_r1_reg: True
   r1_lambda: 0.5
-  r1_place: "outside_loop"
 OPTIMIZATION:
   # These values will be slightly changed if lazy regularization is applied.
   batch_size: 64
@@ -32,7 +44,6 @@ OPTIMIZATION:
   d_lr: 0.0025
   beta1: 0
   beta2: 0.99
-  d_first: False
   g_updates_per_step: 1
   d_updates_per_step: 2
   total_steps: 200000
@@ -43,7 +54,7 @@ AUG:
   ada_target: 0.8
   ada_kimg: 500
   ada_interval: 4
-STYLEGAN:
+STYLEGAN2:
   g_reg_interval: 4
   d_reg_interval: 16
   mapping_network: 8

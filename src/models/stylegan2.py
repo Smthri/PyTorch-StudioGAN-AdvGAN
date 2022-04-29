@@ -199,7 +199,7 @@ class MappingNetwork(torch.nn.Module):
             layer_features=None,  # Number of intermediate features in the mapping layers, None = same as w_dim.
             activation="lrelu",  # Activation function: "relu", "lrelu", etc.
             lr_multiplier=0.01,  # Learning rate multiplier for the mapping layers.
-            w_avg_beta=0.998,  # Decay for tracking the moving average of W during training, None = do not track.
+            w_avg_beta=0.995,  # Decay for tracking the moving average of W during training, None = do not track.
     ):
         super().__init__()
         self.z_dim = z_dim
@@ -228,7 +228,7 @@ class MappingNetwork(torch.nn.Module):
         if num_ws is not None and w_avg_beta is not None:
             self.register_buffer("w_avg", torch.zeros([w_dim]))
 
-    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False):
+    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False):
         # Embed, normalize, and concat inputs.
         x = None
         if self.z_dim > 0:
@@ -245,7 +245,7 @@ class MappingNetwork(torch.nn.Module):
             x = layer(x)
 
         # Update moving average of W.
-        if update_emas and self.w_avg_beta is not None:
+        if self.w_avg_beta is not None and self.training and not skip_w_avg_update:
             self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
 
         # Broadcast.
@@ -408,8 +408,7 @@ class SynthesisBlock(torch.nn.Module):
                                     resample_filter=resample_filter,
                                     channels_last=self.channels_last)
 
-    def forward(self, x, img, ws, force_fp32=False, fused_modconv=None, update_emas=False, **layer_kwargs):
-        _ = update_emas # unused
+    def forward(self, x, img, ws, force_fp32=False, fused_modconv=None, **layer_kwargs):
         misc.assert_shape(ws, [None, self.num_conv + self.num_torgb, self.w_dim])
         w_iter = iter(ws.unbind(dim=1))
         dtype = torch.float16 if self.use_fp16 and not force_fp32 else torch.float32
@@ -517,7 +516,6 @@ class Generator(torch.nn.Module):
             w_dim,  # Intermediate latent (W) dimensionality.
             img_resolution,  # Output resolution.
             img_channels,  # Number of output color channels.
-            MODEL,  # MODEL config required for applying infoGAN
             mapping_kwargs={},  # Arguments for MappingNetwork.
             synthesis_kwargs={},  # Arguments for SynthesisNetwork.
     ):
@@ -525,26 +523,15 @@ class Generator(torch.nn.Module):
         self.z_dim = z_dim
         self.c_dim = c_dim
         self.w_dim = w_dim
-        self.MODEL = MODEL
         self.img_resolution = img_resolution
         self.img_channels = img_channels
-
-        z_extra_dim = 0
-        if self.MODEL.info_type in ["discrete", "both"]:
-            z_extra_dim += self.MODEL.info_num_discrete_c*self.MODEL.info_dim_discrete_c
-        if self.MODEL.info_type in ["continuous", "both"]:
-            z_extra_dim += self.MODEL.info_num_conti_c
-
-        if self.MODEL.info_type != "N/A":
-            self.z_dim += z_extra_dim
-
         self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
         self.num_ws = self.synthesis.num_ws
-        self.mapping = MappingNetwork(z_dim=self.z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
+        self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
-    def forward(self, z, c, eval=False, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
-        ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
-        img = self.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)
+    def forward(self, z, c, eval=False, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
+        ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
+        img = self.synthesis(ws, **synthesis_kwargs)
         return img
 
 
@@ -751,7 +738,6 @@ class Discriminator(torch.nn.Module):
             block_kwargs={},  # Arguments for DiscriminatorBlock.
             mapping_kwargs={},  # Arguments for MappingNetwork.
             epilogue_kwargs={},  # Arguments for DiscriminatorEpilogue.
-            MODEL=None, # needed to check options for infoGAN
     ):
         super().__init__()
         self.c_dim = c_dim
@@ -764,7 +750,6 @@ class Discriminator(torch.nn.Module):
         self.normalize_d_embed = normalize_d_embed
         self.img_resolution_log2 = int(np.log2(img_resolution))
         self.block_resolutions = [2**i for i in range(self.img_resolution_log2, 2, -1)]
-        self.MODEL = MODEL
         channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions + [4]}
         fp16_resolution = max(2**(self.img_resolution_log2 + 1 - num_fp16_res), 8)
 
@@ -830,20 +815,9 @@ class Discriminator(torch.nn.Module):
             else:
                 raise NotImplementedError
 
-        # Q head network for infoGAN
-        if self.MODEL.info_type in ["discrete", "both"]:
-            out_features = self.MODEL.info_num_discrete_c*self.MODEL.info_dim_discrete_c
-            self.info_discrete_linear = FullyConnectedLayer(in_features=channels_dict[4], out_features=out_features, bias=False)
-        if self.MODEL.info_type in ["continuous", "both"]:
-            out_features = self.MODEL.info_num_conti_c
-            self.info_conti_mu_linear = FullyConnectedLayer(in_features=channels_dict[4], out_features=out_features, bias=False)
-            self.info_conti_var_linear = FullyConnectedLayer(in_features=channels_dict[4], out_features=out_features, bias=False)
-
-    def forward(self, img, label, eval=False, adc_fake=False, update_emas=False, **block_kwargs):
-        _ = update_emas # unused
+    def forward(self, img, label, eval=False, adc_fake=False, **block_kwargs):
         x, embed, proxy, cls_output = None, None, None, None
         mi_embed, mi_proxy, mi_cls_output = None, None, None
-        info_discrete_c_logits, info_conti_mu, info_conti_var = None, None, None
         for res in self.block_resolutions:
             block = getattr(self, f"b{res}")
             x, img = block(x, img, **block_kwargs)
@@ -860,13 +834,6 @@ class Discriminator(torch.nn.Module):
             else:
                 label = label*2
         oh_label = F.one_hot(label, self.num_classes * 2 if self.aux_cls_type=="ADC" else self.num_classes)
-
-        # forward pass through InfoGAN Q head
-        if self.MODEL.info_type in ["discrete", "both"]:
-            info_discrete_c_logits = self.info_discrete_linear(h)
-        if self.MODEL.info_type in ["continuous", "both"]:
-            info_conti_mu = self.info_conti_mu_linear(h)
-            info_conti_var = torch.exp(self.info_conti_var_linear(h))
 
         # class conditioning
         if self.d_cond_mtd == "AC":
@@ -917,8 +884,5 @@ class Discriminator(torch.nn.Module):
             "label": label,
             "mi_embed": mi_embed,
             "mi_proxy": mi_proxy,
-            "mi_cls_output": mi_cls_output,
-            "info_discrete_c_logits": info_discrete_c_logits,
-            "info_conti_mu": info_conti_mu,
-            "info_conti_var": info_conti_var
+            "mi_cls_output": mi_cls_output
         }

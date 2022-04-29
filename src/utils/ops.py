@@ -8,10 +8,26 @@ from torch.nn.utils import spectral_norm
 from torch.nn import init
 import torch
 import torch.nn as nn
-import numpy as np
 
 
 class ConditionalBatchNorm2d(nn.Module):
+    # https://github.com/voletiv/self-attention-GAN-pytorch
+    def __init__(self, num_classes, num_features, MODULES):
+        super().__init__()
+        self.num_features = num_features
+        self.bn = batchnorm_2d(in_features=num_features, eps=1e-4, momentum=0.1, affine=False)
+
+        self.embed0 = MODULES.g_embedding(num_embeddings=num_classes, embedding_dim=num_features)
+        self.embed1 = MODULES.g_embedding(num_embeddings=num_classes, embedding_dim=num_features)
+
+    def forward(self, x, y):
+        gain = (1 + self.embed0(y)).view(-1, self.num_features, 1, 1)
+        bias = self.embed1(y).view(-1, self.num_features, 1, 1)
+        out = self.bn(x)
+        return out * gain + bias
+
+
+class BigGANConditionalBatchNorm2d(nn.Module):
     # https://github.com/voletiv/self-attention-GAN-pytorch
     def __init__(self, in_features, out_features, MODULES):
         super().__init__()
@@ -55,7 +71,7 @@ class SelfAttention(nn.Module):
 
         self.maxpool = nn.MaxPool2d(2, stride=2, padding=0)
         self.softmax = nn.Softmax(dim=-1)
-        self.sigma = nn.Parameter(torch.zeros(1), requires_grad=True)
+        self.sigma = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
         _, ch, h, w = x.size()
@@ -78,35 +94,6 @@ class SelfAttention(nn.Module):
         attn_g = attn_g.view(-1, ch // 2, h, w)
         attn_g = self.conv1x1_attn(attn_g)
         return x + self.sigma * attn_g
-
-
-class LeCamEMA(object):
-    # Simple wrapper that applies EMA to losses.
-    # https://github.com/google/lecam-gan/blob/master/third_party/utils.py
-    def __init__(self, init=7777, decay=0.9, start_iter=0):
-        self.G_loss = init
-        self.D_loss_real = init
-        self.D_loss_fake = init
-        self.D_real = init
-        self.D_fake = init
-        self.decay = decay
-        self.start_itr = start_iter
-
-    def update(self, cur, mode, itr):
-        if itr < self.start_itr:
-            decay = 0.0
-        else:
-            decay = self.decay
-        if mode == "G_loss":
-          self.G_loss = self.G_loss*decay + cur*(1 - decay)
-        elif mode == "D_loss_real":
-          self.D_loss_real = self.D_loss_real*decay + cur*(1 - decay)
-        elif mode == "D_loss_fake":
-          self.D_loss_fake = self.D_loss_fake*decay + cur*(1 - decay)
-        elif mode == "D_real":
-          self.D_real = self.D_real*decay + cur*(1 - decay)
-        elif mode == "D_fake":
-          self.D_fake = self.D_fake*decay + cur*(1 - decay)
 
 
 def init_weights(modules, initialize):
@@ -223,18 +210,3 @@ def adjust_learning_rate(optimizer, lr_org, epoch, total_epoch, dataset):
 
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-
-
-def quantize_images(x):
-    x = (x + 1)/2
-    x = (255.0*x + 0.5).clamp(0.0, 255.0)
-    x = x.detach().cpu().numpy().astype(np.uint8)
-    return x
-
-
-def resize_images(x, resizer, ToTensor, mean, std, device="cuda"):
-    x = x.transpose((0, 2, 3, 1))
-    x = list(map(lambda x: ToTensor(resizer(x)), list(x)))
-    x = torch.stack(x, 0).to(device)
-    x = (x/255.0 - mean)/std
-    return x

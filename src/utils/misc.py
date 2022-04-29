@@ -22,10 +22,9 @@ from itertools import chain
 from tqdm import tqdm
 from scipy import linalg
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
+import torch.distributed as dist
 import torch.multiprocessing as mp
-import torchvision.transforms as transforms
 import shutil
 import numpy as np
 import seaborn as sns
@@ -59,6 +58,27 @@ class SaveOutput:
         self.outputs = []
 
 
+class GatherLayer(torch.autograd.Function):
+    """
+    This file is copied from
+    https://github.com/open-mmlab/OpenSelfSup/blob/master/openselfsup/models/utils/gather_layer.py
+    Gather tensors from all process, supporting backward propagation
+    """
+    @staticmethod
+    def forward(ctx, input):
+        ctx.save_for_backward(input)
+        output = [torch.zeros_like(input) for _ in range(dist.get_world_size())]
+        dist.all_gather(output, input)
+        return tuple(output)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        input, = ctx.saved_tensors
+        grad_out = torch.zeros_like(input)
+        grad_out[:] = grads[dist.get_rank()]
+        return grad_out
+
+
 class GeneratorController(object):
     def __init__(self, generator, generator_mapping, generator_synthesis, batch_statistics, standing_statistics,
                  standing_max_batch, standing_step, cfgs, device, global_rank, logger, std_stat_counter):
@@ -90,7 +110,7 @@ class GeneratorController(object):
                                           LOSS=self.cfgs.LOSS,
                                           OPTIMIZATION=self.cfgs.OPTIMIZATION,
                                           RUN=self.cfgs.RUN,
-                                          STYLEGAN=self.cfgs.STYLEGAN,
+                                          STYLEGAN2=self.cfgs.STYLEGAN2,
                                           device=self.device,
                                           global_rank=self.global_rank,
                                           logger=self.logger)
@@ -194,13 +214,10 @@ def toggle_grad(model, grad, num_freeze_layers=-1, is_stylegan=False):
         for name, param in model.named_parameters():
             param.requires_grad = grad
     else:
-        try:
-            num_blocks = len(model.in_dims)
-            assert num_freeze_layers < num_blocks,\
-                "cannot freeze the {nfl}th block > total {nb} blocks.".format(nfl=num_freeze_layers,
-                                                                            nb=num_blocks)
-        except:
-            pass
+        num_blocks = len(model.in_dims)
+        assert num_freeze_layers < num_blocks,\
+            "cannot freeze the {nfl}th block > total {nb} blocks.".format(nfl=num_freeze_layers,
+                                                                          nb=num_blocks)
 
         if num_freeze_layers == -1:
             for name, param in model.named_parameters():
@@ -297,7 +314,7 @@ def calculate_all_sn(model, prefix):
     return sigmas
 
 
-def apply_standing_statistics(generator, standing_max_batch, standing_step, DATA, MODEL, LOSS, OPTIMIZATION, RUN, STYLEGAN,
+def apply_standing_statistics(generator, standing_max_batch, standing_step, DATA, MODEL, LOSS, OPTIMIZATION, RUN, STYLEGAN2,
                               device, global_rank, logger):
     generator.train()
     generator.apply(reset_bn_statistics)
@@ -309,7 +326,7 @@ def apply_standing_statistics(generator, standing_max_batch, standing_step, DATA
             rand_batch_size = random.randint(1, batch_size_per_gpu)
         else:
             rand_batch_size = random.randint(1, batch_size_per_gpu) * OPTIMIZATION.world_size
-        fake_images, fake_labels, _, _, _, _, _ = sample.generate_images(z_prior=MODEL.z_prior,
+        fake_images, fake_labels, _, _, _ = sample.generate_images(z_prior=MODEL.z_prior,
                                                                    truncation_factor=-1,
                                                                    batch_size=rand_batch_size,
                                                                    z_dim=MODEL.z_dim,
@@ -321,12 +338,10 @@ def apply_standing_statistics(generator, standing_max_batch, standing_step, DATA
                                                                    is_train=True,
                                                                    LOSS=LOSS,
                                                                    RUN=RUN,
-                                                                   MODEL=MODEL,
-                                                                   is_stylegan=MODEL.backbone in ["stylegan2", "stylegan3"],
+                                                                   is_stylegan=MODEL.backbone=="stylegan2",
                                                                    generator_mapping=None,
                                                                    generator_synthesis=None,
                                                                    style_mixing_p=0.0,
-                                                                   stylegan_update_emas=False,
                                                                    device=device,
                                                                    cal_trsp_cost=False)
     generator.eval()
@@ -414,7 +429,7 @@ def plot_img_canvas(images, save_path, num_cols, logger, logging=True):
     if not exists(directory):
         os.makedirs(directory)
 
-    save_image(((images + 1)/2).clamp(0.0, 1.0), save_path, padding=0, nrow=num_cols)
+    save_image(images, save_path, padding=0, nrow=num_cols)
     if logging:
         logger.info("Save image canvas to {}".format(save_path))
 
@@ -469,32 +484,31 @@ def plot_tsne_scatter_plot(df, tsne_results, flag, directory, logger, logging=Tr
         logger.info("Save image to {path}".format(path=save_path))
 
 
-def save_images_png(data_loader, generator, discriminator, is_generate, num_images, y_sampler, batch_size, z_prior,
-                    truncation_factor, z_dim, num_classes, LOSS, OPTIMIZATION, RUN, MODEL, is_stylegan, generator_mapping,
-                    generator_synthesis, directory, device):
+def save_images_npz(data_loader, generator, discriminator, is_generate, num_images, y_sampler, batch_size, z_prior,
+                    truncation_factor, z_dim, num_classes, LOSS, RUN, is_stylegan, generator_mapping, generator_synthesis,
+                    directory, device):
     num_batches = math.ceil(float(num_images) / float(batch_size))
-    if RUN.distributed_data_parallel: num_batches = num_batches//OPTIMIZATION.world_size + 1
     if is_generate:
         image_type = "fake"
     else:
         image_type = "real"
         data_iter = iter(data_loader)
 
-    print("Save {num_images} {image_type} images in png format.".format(num_images=num_images, image_type=image_type))
+    print("Save {num_images} {image_type} images in npz format.".format(num_images=num_images, image_type=image_type))
 
-    directory = join(directory, image_type)
+    directory = join(directory, image_type, "npz")
     if exists(directory):
         shutil.rmtree(directory)
     os.makedirs(directory)
-    for f in range(num_classes):
-        os.makedirs(join(directory, str(f)))
 
+    x = []
+    y = []
     with torch.no_grad() if not LOSS.apply_lo else dummy_context_mgr() as mpc:
-        for i in tqdm(range(0, num_batches), disable=False):
+        for i in tqdm(range(0, num_batches)):
             start = i * batch_size
             end = start + batch_size
             if is_generate:
-                images, labels, _, _, _, _, _= sample.generate_images(z_prior=z_prior,
+                images, labels, _, _, _ = sample.generate_images(z_prior=z_prior,
                                                                  truncation_factor=truncation_factor,
                                                                  batch_size=batch_size,
                                                                  z_dim=z_dim,
@@ -506,12 +520,10 @@ def save_images_png(data_loader, generator, discriminator, is_generate, num_imag
                                                                  is_train=False,
                                                                  LOSS=LOSS,
                                                                  RUN=RUN,
-                                                                 MODEL=MODEL,
                                                                  is_stylegan=is_stylegan,
                                                                  generator_mapping=generator_mapping,
                                                                  generator_synthesis=generator_synthesis,
                                                                  style_mixing_p=0.0,
-                                                                 stylegan_update_emas=False,
                                                                  device=device,
                                                                  cal_trsp_cost=False)
             else:
@@ -520,9 +532,70 @@ def save_images_png(data_loader, generator, discriminator, is_generate, num_imag
                 except StopIteration:
                     break
 
+            x += [np.uint8(255 * (images.detach().cpu().numpy() + 1) / 2.)]
+            y += [labels.detach().cpu().numpy()]
+
+    x = np.concatenate(x, 0)[:num_images]
+    y = np.concatenate(y, 0)[:num_images]
+    print("Images shape: {image_shape}, Labels shape: {label_shape}".format(image_shape=x.shape, label_shape=y.shape))
+    npz_filename = join(directory, "samples.npz")
+    print("Finish saving npz to {file_name}".format(file_name=npz_filename))
+    np.savez(npz_filename, **{"x": x, "y": y})
+
+
+def save_images_png(data_loader, generator, discriminator, is_generate, num_images, y_sampler, batch_size, z_prior,
+                    truncation_factor, z_dim, num_classes, LOSS, RUN, is_stylegan, generator_mapping, generator_synthesis,
+                    directory, device, sr_module=None):
+    num_batches = math.ceil(float(num_images) / float(batch_size))
+    if is_generate:
+        image_type = "fake"
+    else:
+        image_type = "real"
+        data_iter = iter(data_loader)
+
+    print("Save {num_images} {image_type} images in png format.".format(num_images=num_images, image_type=image_type))
+
+    directory = join(directory, image_type, "png")
+    if exists(directory):
+        shutil.rmtree(directory)
+    os.makedirs(directory)
+    for f in range(num_classes):
+        os.makedirs(join(directory, str(f)))
+
+    with torch.no_grad() if not LOSS.apply_lo else dummy_context_mgr() as mpc:
+        for i in tqdm(range(0, num_batches), disable=False):
+            start = i * batch_size
+            end = start + batch_size
+            if is_generate:
+                images, labels, _, _, _ = sample.generate_images(z_prior=z_prior,
+                                                                 truncation_factor=truncation_factor,
+                                                                 batch_size=batch_size,
+                                                                 z_dim=z_dim,
+                                                                 num_classes=num_classes,
+                                                                 y_sampler=y_sampler,
+                                                                 radius="N/A",
+                                                                 generator=generator,
+                                                                 discriminator=discriminator,
+                                                                 is_train=False,
+                                                                 LOSS=LOSS,
+                                                                 RUN=RUN,
+                                                                 is_stylegan=is_stylegan,
+                                                                 generator_mapping=generator_mapping,
+                                                                 generator_synthesis=generator_synthesis,
+                                                                 style_mixing_p=0.0,
+                                                                 device=device,
+                                                                 cal_trsp_cost=False)
+                if sr_module is not None:
+                    images = sr_module(images)
+            else:
+                try:
+                    images, labels = next(data_iter)
+                except StopIteration:
+                    break
+
             for idx, img in enumerate(images.detach()):
                 if batch_size * i + idx < num_images:
-                    save_image(((img+1)/2).clamp(0.0, 1.0),
+                    save_image((img + 1) / 2,
                                join(directory, str(labels[idx].item()), "{idx}.png".format(idx=batch_size * i + idx)))
                 else:
                     pass
@@ -547,16 +620,14 @@ def interpolate(x0, x1, num_midpoints):
 
 def accm_values_convert_dict(list_dict, value_dict, step, interval):
     for name, value_list in list_dict.items():
-        if step is None:
-            value_list += [value_dict[name]]
-        else:
+        try:
+            value_list[step // interval - 1] = value_dict[name]
+        except IndexError:
             try:
-                value_list[step // interval - 1] = value_dict[name]
-            except IndexError:
-                try:
-                    value_list += [value_dict[name]]
-                except:
-                    raise KeyError
+                value_list += [value_dict[name]]
+            except:
+                raise KeyError
+
         list_dict[name] = value_list
     return list_dict
 
@@ -580,7 +651,6 @@ def load_ImageNet_label_dict():
         label += 1
     return label_dict
 
-
 def compute_gradient(fx, logits, label, num_classes):
     probs = torch.nn.Softmax(dim=1)(logits.detach().cpu())
     gt_prob = F.one_hot(label, num_classes)
@@ -588,7 +658,6 @@ def compute_gradient(fx, logits, label, num_classes):
     preds = (probs*gt_prob).sum(-1)
     grad = torch.mean(fx.unsqueeze(1) * oneMp.unsqueeze(2), dim=0)
     return fx.norm(dim=1), preds, torch.norm(grad, dim=1)
-
 
 def load_parameters(src, dst, strict=True):
     mismatch_names = []
@@ -605,7 +674,6 @@ def load_parameters(src, dst, strict=True):
             mismatch_names.append(dst_key)
             assert not strict, "dst_key is not in src_dict."
     return mismatch_names
-
 
 def enable_allreduce(dict_):
     loss = 0

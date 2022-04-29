@@ -8,33 +8,12 @@ from torch.nn import DataParallel
 from torch import autograd
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 import torch.nn.functional as F
 import numpy as np
 
 from utils.style_ops import conv2d_gradfix
 import utils.ops as ops
-
-
-class GatherLayer(torch.autograd.Function):
-    """
-    This file is copied from
-    https://github.com/open-mmlab/OpenSelfSup/blob/master/openselfsup/models/utils/gather_layer.py
-    Gather tensors from all process, supporting backward propagation
-    """
-    @staticmethod
-    def forward(ctx, input):
-        ctx.save_for_backward(input)
-        output = [torch.zeros_like(input) for _ in range(dist.get_world_size())]
-        dist.all_gather(output, input)
-        return tuple(output)
-
-    @staticmethod
-    def backward(ctx, *grads):
-        input, = ctx.saved_tensors
-        grad_out = torch.zeros_like(input)
-        grad_out[:] = grads[dist.get_rank()]
-        return grad_out
+import utils.misc as misc
 
 
 class CrossEntropyLoss(torch.nn.Module):
@@ -91,9 +70,9 @@ class ConditionalContrastiveLoss(torch.nn.Module):
 
     def forward(self, embed, proxy, label, **_):
         if self.DDP:
-            embed = torch.cat(GatherLayer.apply(embed), dim=0)
-            proxy = torch.cat(GatherLayer.apply(proxy), dim=0)
-            label = torch.cat(GatherLayer.apply(label), dim=0)
+            embed = torch.cat(misc.GatherLayer.apply(embed), dim=0)
+            proxy = torch.cat(misc.GatherLayer.apply(proxy), dim=0)
+            label = torch.cat(misc.GatherLayer.apply(label), dim=0)
 
         sim_matrix = self.calculate_similarity_matrix(embed, embed)
         sim_matrix = torch.exp(self._remove_diag(sim_matrix) / self.temperature)
@@ -143,9 +122,9 @@ class MiConditionalContrastiveLoss(torch.nn.Module):
 
     def forward(self, mi_embed, mi_proxy, label, **_):
         if self.DDP:
-            mi_embed = torch.cat(GatherLayer.apply(mi_embed), dim=0)
-            mi_proxy = torch.cat(GatherLayer.apply(mi_proxy), dim=0)
-            label = torch.cat(GatherLayer.apply(label), dim=0)
+            mi_embed = torch.cat(misc.GatherLayer.apply(mi_embed), dim=0)
+            mi_proxy = torch.cat(misc.GatherLayer.apply(mi_proxy), dim=0)
+            label = torch.cat(misc.GatherLayer.apply(label), dim=0)
 
         sim_matrix = self.calculate_similarity_matrix(mi_embed, mi_embed)
         sim_matrix = torch.exp(self._remove_diag(sim_matrix) / self.temperature)
@@ -198,9 +177,9 @@ class Data2DataCrossEntropyLoss(torch.nn.Module):
     def forward(self, embed, proxy, label, **_):
         # If train a GAN throuh DDP, gather all data on the master rank
         if self.DDP:
-            embed = torch.cat(GatherLayer.apply(embed), dim=0)
-            proxy = torch.cat(GatherLayer.apply(proxy), dim=0)
-            label = torch.cat(GatherLayer.apply(label), dim=0)
+            embed = torch.cat(misc.GatherLayer.apply(embed), dim=0)
+            proxy = torch.cat(misc.GatherLayer.apply(proxy), dim=0)
+            label = torch.cat(misc.GatherLayer.apply(label), dim=0)
 
         # calculate similarities between sample embeddings
         sim_matrix = self.calculate_similarity_matrix(embed, embed) + self.m_p - 1
@@ -265,9 +244,9 @@ class MiData2DataCrossEntropyLoss(torch.nn.Module):
     def forward(self, mi_embed, mi_proxy, label, **_):
         # If train a GAN throuh DDP, gather all data on the master rank
         if self.DDP:
-            mi_embed = torch.cat(GatherLayer.apply(mi_embed), dim=0)
-            mi_proxy = torch.cat(GatherLayer.apply(mi_proxy), dim=0)
-            label = torch.cat(GatherLayer.apply(label), dim=0)
+            mi_embed = torch.cat(misc.GatherLayer.apply(mi_embed), dim=0)
+            mi_proxy = torch.cat(misc.GatherLayer.apply(mi_proxy), dim=0)
+            label = torch.cat(misc.GatherLayer.apply(label), dim=0)
 
         # calculate similarities between sample embeddings
         sim_matrix = self.calculate_similarity_matrix(mi_embed, mi_embed) + self.m_p - 1
@@ -294,17 +273,16 @@ class MiData2DataCrossEntropyLoss(torch.nn.Module):
 
 
 class PathLengthRegularizer:
-    def __init__(self, device, pl_decay=0.01, pl_weight=2, pl_no_weight_grad=False):
-        self.pl_decay = pl_decay
-        self.pl_weight = pl_weight
+    def __init__(self, device, pl_decay=0.01, pl_weight=2):
+        self.pl_decay = 0.01
+        self.pl_weight = 2
         self.pl_mean = torch.zeros([], device=device)
-        self.pl_no_weight_grad = pl_no_weight_grad
 
     def cal_pl_reg(self, fake_images, ws):
         #ws refers to weight style
         #receives new fake_images of original batch (in original implementation, fakes_images used for calculating g_loss and pl_loss is generated independently)
         pl_noise = torch.randn_like(fake_images) / np.sqrt(fake_images.shape[2] * fake_images.shape[3])
-        with conv2d_gradfix.no_weight_gradients(self.pl_no_weight_grad):
+        with conv2d_gradfix.no_weight_gradients():
             pl_grads = torch.autograd.grad(outputs=[(fake_images * pl_noise).sum()], inputs=[ws], create_graph=True, only_inputs=True)[0]
         pl_lengths = pl_grads.square().sum(2).mean(1).sqrt()
         pl_mean = self.pl_mean.lerp(pl_lengths.mean(), self.pl_decay)
@@ -314,32 +292,22 @@ class PathLengthRegularizer:
         return loss_Gpl
 
 
-def enable_allreduce(dict_):
-    loss = 0
-    for key, value in dict_.items():
-        if value is not None and key != "label":
-            loss += value.mean()*0
-    return loss
-
-
 def d_vanilla(d_logit_real, d_logit_fake, DDP):
-    d_loss = torch.mean(F.softplus(-d_logit_real)) + torch.mean(F.softplus(d_logit_fake))
+    device = d_logit_real.get_device()
+    ones = torch.ones_like(d_logit_real, device=device, requires_grad=False)
+    d_loss = -torch.mean(nn.LogSigmoid()(d_logit_real) + (ones - d_logit_fake.sigmoid() + 1e-6).log())
     return d_loss
 
-
 def g_vanilla(d_logit_fake, DDP):
-    return torch.mean(F.softplus(-d_logit_fake))
-
+    return -torch.mean(nn.LogSigmoid()(d_logit_fake))
 
 def d_logistic(d_logit_real, d_logit_fake, DDP):
     d_loss = F.softplus(-d_logit_real) + F.softplus(d_logit_fake)
     return d_loss.mean()
 
-
 def g_logistic(d_logit_fake, DDP):
     # basically same as g_vanilla.
     return F.softplus(-d_logit_fake).mean()
-
 
 def d_ls(d_logit_real, d_logit_fake, DDP):
     d_loss = 0.5 * (d_logit_real - torch.ones_like(d_logit_real))**2 + 0.5 * (d_logit_fake)**2
@@ -385,12 +353,6 @@ def feature_matching_loss(real_embed, fake_embed):
     # feature matching criterion
     fm_loss = torch.mean(torch.abs(torch.mean(fake_embed, 0) - torch.mean(real_embed, 0)))
     return fm_loss
-
-
-def lecam_reg(d_logit_real, d_logit_fake, ema):
-    reg = torch.mean(F.relu(d_logit_real - ema.D_fake).pow(2)) + \
-          torch.mean(F.relu(ema.D_real - d_logit_fake).pow(2))
-    return reg
 
 
 def cal_deriv(inputs, outputs, device):
@@ -440,7 +402,7 @@ def cal_grad_penalty(real_images, real_labels, fake_images, discriminator, devic
     grads = cal_deriv(inputs=interpolates, outputs=fake_dict["adv_output"], device=device)
     grads = grads.view(grads.size(0), -1)
 
-    grad_penalty = ((grads.norm(2, dim=1) - 1)**2).mean() + interpolates[:,0,0,0].mean()*0
+    grad_penalty = ((grads.norm(2, dim=1) - 1)**2).mean()
     return grad_penalty
 
 
@@ -458,7 +420,7 @@ def cal_dra_penalty(real_images, real_labels, discriminator, device):
     grads = cal_deriv(inputs=interpolates, outputs=fake_dict["adv_output"], device=device)
     grads = grads.view(grads.size(0), -1)
 
-    grad_penalty = ((grads.norm(2, dim=1) - 1)**2).mean() + interpolates[:,0,0,0].mean()*0
+    grad_penalty = ((grads.norm(2, dim=1) - 1)**2).mean()
     return grad_penalty
 
 
@@ -476,7 +438,7 @@ def cal_maxgrad_penalty(real_images, real_labels, fake_images, discriminator, de
     grads = cal_deriv(inputs=interpolates, outputs=fake_dict["adv_output"], device=device)
     grads = grads.view(grads.size(0), -1)
 
-    maxgrad_penalty = torch.max(grads.norm(2, dim=1)**2) + interpolates[:,0,0,0].mean()*0
+    maxgrad_penalty = torch.max(grads.norm(2, dim=1)**2)
     return maxgrad_penalty
 
 
@@ -485,26 +447,15 @@ def cal_r1_reg(adv_output, images, device):
     grad_dout = cal_deriv(inputs=images, outputs=adv_output.sum(), device=device)
     grad_dout2 = grad_dout.pow(2)
     assert (grad_dout2.size() == images.size())
-    r1_reg = 0.5 * grad_dout2.contiguous().view(batch_size, -1).sum(1).mean(0) + images[:,0,0,0].mean()*0
+    r1_reg = 0.5 * grad_dout2.contiguous().view(batch_size, -1).sum(1).mean(0)
     return r1_reg
-
-
-def adjust_k(current_k, topk_gamma, sup_k):
-    current_k = max(current_k * topk_gamma, sup_k)
-    return current_k
-
-
-def normal_nll_loss(x, mu, var):
-    # https://github.com/Natsu6767/InfoGAN-PyTorch/blob/master/utils.py
-    # Calculate the negative log likelihood of normal distribution.
-    # Needs to be minimized in InfoGAN. (Treats Q(c]x) as a factored Gaussian)
-    logli = -0.5 * (var.mul(2 * np.pi) + 1e-6).log() - (x - mu).pow(2).div(var.mul(2.0) + 1e-6)
-    nll = -(logli.sum(1).mean())
-    return nll
-
 
 def stylegan_cal_r1_reg(adv_output, images):
     with conv2d_gradfix.no_weight_gradients():
         r1_grads = torch.autograd.grad(outputs=[adv_output.sum()], inputs=[images], create_graph=True, only_inputs=True)[0]
-    r1_penalty = r1_grads.square().sum([1,2,3]) / 2
+    r1_penalty = r1_grads.square().sum([1,2,3])/2
     return r1_penalty.mean()
+
+def adjust_k(current_k, topk_gamma, sup_k):
+    current_k = max(current_k * topk_gamma, sup_k)
+    return current_k

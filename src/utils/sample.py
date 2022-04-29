@@ -19,10 +19,7 @@ import numpy as np
 
 import utils.ops as ops
 import utils.losses as losses
-try:
-    import utils.misc as misc
-except AttributeError:
-    pass
+import utils.misc as misc
 
 
 def truncated_normal(size, threshold=1.):
@@ -87,8 +84,8 @@ def sample_zy(z_prior, batch_size, z_dim, num_classes, truncation_factor, y_samp
 
 
 def generate_images(z_prior, truncation_factor, batch_size, z_dim, num_classes, y_sampler, radius, generator, discriminator,
-                    is_train, LOSS, RUN, MODEL, device, is_stylegan, generator_mapping, generator_synthesis, style_mixing_p,
-                    stylegan_update_emas, cal_trsp_cost):
+                    is_train, LOSS, RUN, device, is_stylegan, generator_mapping, generator_synthesis, style_mixing_p,
+                    cal_trsp_cost, real_images, real_labels, is_advgan):
     if is_train:
         truncation_factor = -1.0
         lo_steps = LOSS.lo_steps4train
@@ -101,21 +98,18 @@ def generate_images(z_prior, truncation_factor, batch_size, z_dim, num_classes, 
             else:
                 assert 0 <= truncation_factor, "truncation_factor must lie btw 0(strong truncation) ~ inf(no truncation)"
 
-    zs, fake_labels, zs_eps = sample_zy(z_prior=z_prior,
-                                        batch_size=batch_size,
-                                        z_dim=z_dim,
-                                        num_classes=num_classes,
-                                        truncation_factor=-1 if is_stylegan else truncation_factor,
-                                        y_sampler=y_sampler,
-                                        radius=radius,
-                                        device=device)
-    info_discrete_c, info_conti_c = None, None
-    if MODEL.info_type in ["discrete", "both"]:
-        info_discrete_c = torch.randint(MODEL.info_dim_discrete_c,(batch_size, MODEL.info_num_discrete_c), device=device)
-        zs = torch.cat((zs, F.one_hot(info_discrete_c, MODEL.info_dim_discrete_c).view(batch_size, -1)), dim=1)
-    if MODEL.info_type in ["continuous", "both"]:
-        info_conti_c = torch.rand(batch_size, MODEL.info_num_conti_c, device=device) * 2 - 1
-        zs = torch.cat((zs, info_conti_c), dim=1)
+    if is_advgan:
+        zs, fake_labels, zs_eps = sample_zy(z_prior=z_prior,
+                                            batch_size=batch_size,
+                                            z_dim=z_dim,
+                                            num_classes=num_classes,
+                                            truncation_factor=-1 if is_stylegan else truncation_factor,
+                                            y_sampler=y_sampler,
+                                            radius=radius,
+                                            device=device)
+    else:
+        fake_labels = real_labels
+        zs = real_images
 
     trsp_cost = None
     if LOSS.apply_lo:
@@ -149,7 +143,6 @@ def generate_images(z_prior, truncation_factor, batch_size, z_dim, num_classes, 
                                                    fake_labels=fake_labels,
                                                    num_classes=num_classes,
                                                    style_mixing_p=style_mixing_p,
-                                                   update_emas=stylegan_update_emas,
                                                    generator_mapping=generator_mapping,
                                                    generator_synthesis=generator_synthesis,
                                                    truncation_psi=truncation_factor,
@@ -164,7 +157,6 @@ def generate_images(z_prior, truncation_factor, batch_size, z_dim, num_classes, 
                                                                fake_labels=fake_labels,
                                                                num_classes=num_classes,
                                                                style_mixing_p=style_mixing_p,
-                                                               update_emas=stylegan_update_emas,
                                                                generator_mapping=generator_mapping,
                                                                generator_synthesis=generator_synthesis,
                                                                truncation_psi=truncation_factor,
@@ -173,20 +165,19 @@ def generate_images(z_prior, truncation_factor, batch_size, z_dim, num_classes, 
             _, fake_images_eps = generator(zs_eps, fake_labels, eval=not is_train)
     else:
         fake_images_eps = None
-    return fake_images, fake_labels, fake_images_eps, trsp_cost, ws, info_discrete_c, info_conti_c
+    return fake_images, fake_labels, fake_images_eps, trsp_cost, ws
 
-def stylegan_generate_images(zs, fake_labels, num_classes, style_mixing_p, update_emas, 
-                             generator_mapping, generator_synthesis, truncation_psi, truncation_cutoff):
+def stylegan_generate_images(zs, fake_labels, num_classes, style_mixing_p, generator_mapping, generator_synthesis, truncation_psi, truncation_cutoff):
     one_hot_fake_labels = F.one_hot(fake_labels, num_classes=num_classes)
     if truncation_psi == -1:
-        ws = generator_mapping(zs, one_hot_fake_labels, truncation_psi=1, update_emas=update_emas)
+        ws = generator_mapping(zs, one_hot_fake_labels, truncation_psi=1)
     else:
-        ws = generator_mapping(zs, one_hot_fake_labels, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
+        ws = generator_mapping(zs, one_hot_fake_labels, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
     if style_mixing_p > 0:
         cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
         cutoff = torch.where(torch.rand([], device=ws.device) < style_mixing_p, cutoff, torch.full_like(cutoff, ws.shape[1]))
-        ws[:, cutoff:] = generator_mapping(torch.randn_like(zs), one_hot_fake_labels, update_emas=False)[:, cutoff:]
-    fake_images = generator_synthesis(ws, update_emas=update_emas)
+        ws[:, cutoff:] = generator_mapping(torch.randn_like(zs), one_hot_fake_labels, skip_w_avg_update=True)[:, cutoff:]
+    fake_images = generator_synthesis(ws)
     return ws, fake_images
 
 
@@ -242,10 +233,8 @@ def make_target_cls_sampler(dataset, target_class):
         targets = dataset.data.targets
     except:
         targets = dataset.labels
-    label_indices = []
-    for i in range(len(dataset)):
-        if targets[i] == target_class:
-            label_indices.append(i)
-    num_samples = len(label_indices)
-    sampler = torch.utils.data.sampler.SubsetRandomSampler(label_indices)
+    weights = [True if target == target_class else False for target in targets]
+    num_samples = sum(weights)
+    weights = torch.DoubleTensor(weights)
+    sampler = torch.utils.data.sampler.WeightedRandomSampler(weights, len(weights), replacement=False)
     return num_samples, sampler

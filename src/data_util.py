@@ -56,7 +56,6 @@ class Dataset_(Dataset):
                  crop_long_edge=False,
                  resize_size=None,
                  random_flip=False,
-                 normalize=True,
                  hdf5_path=None,
                  load_data_in_memory=False):
         super(Dataset_, self).__init__()
@@ -64,28 +63,24 @@ class Dataset_(Dataset):
         self.data_dir = data_dir
         self.train = train
         self.random_flip = random_flip
-        self.normalize = normalize
         self.hdf5_path = hdf5_path
         self.load_data_in_memory = load_data_in_memory
         self.trsf_list = []
 
         if self.hdf5_path is None:
             if crop_long_edge:
-                self.trsf_list += [CenterCropLongEdge()]
+                crop_op = RandomCropLongEdge() if self.train else CenterCropLongEdge()
+                self.trsf_list += [crop_op]
+
             if resize_size is not None:
-                self.trsf_list += [transforms.Resize(resize_size, Image.LANCZOS)]
+                self.trsf_list += [transforms.Resize(resize_size)]
         else:
             self.trsf_list += [transforms.ToPILImage()]
 
         if self.random_flip:
             self.trsf_list += [transforms.RandomHorizontalFlip()]
 
-        if self.normalize:
-            self.trsf_list += [transforms.ToTensor()]
-            self.trsf_list += [transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])]
-        else:
-            self.trsf_list += [transforms.PILToTensor()]
-
+        self.trsf_list += [transforms.ToTensor(), transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])]
         self.trsf = transforms.Compose(self.trsf_list)
 
         self.load_dataset()
@@ -113,7 +108,9 @@ class Dataset_(Dataset):
 
     def _get_hdf5(self, index):
         with h5.File(self.hdf5_path, "r") as f:
-            return f["imgs"][index], f["labels"][index]
+            img = np.transpose(f["imgs"][index], (1, 2, 0))
+            label = f["labels"][index]
+        return img, label
 
     def __len__(self):
         if self.hdf5_path is None:
@@ -127,7 +124,7 @@ class Dataset_(Dataset):
             img, label = self.data[index]
         else:
             if self.load_data_in_memory:
-                img, label = self.data[index], self.labels[index]
+                img, label = np.transpose(self.data[index], (1, 2, 0)), self.labels[index]
             else:
                 img, label = self._get_hdf5(index)
         return self.trsf(img), int(label)
