@@ -243,8 +243,9 @@ class WORKER(object):
                     # load real images and labels onto the GPU memory
                     real_images = real_image_basket[batch_counter].to(self.local_rank, non_blocking=True)
                     real_labels = real_label_basket[batch_counter].to(self.local_rank, non_blocking=True)
+                    real_images_ = self.AUG.series_augment(real_images)
                     # sample fake images and labels from p(G(z), y)
-                    fake_images, fake_labels, fake_images_eps, trsp_cost, ws = sample.generate_images(
+                    noise, fake_labels, fake_images_eps, trsp_cost, ws = sample.generate_images(
                         z_prior=self.MODEL.z_prior,
                         truncation_factor=-1.0,
                         batch_size=self.OPTIMIZATION.batch_size,
@@ -262,7 +263,11 @@ class WORKER(object):
                         generator_synthesis=self.Gen_synthesis,
                         is_stylegan=self.is_stylegan,
                         style_mixing_p=self.cfgs.STYLEGAN2.style_mixing_p,
-                        cal_trsp_cost=True if self.LOSS.apply_lo else False)
+                        cal_trsp_cost=True if self.LOSS.apply_lo else False,
+                        real_images=real_images_,
+                        real_labels=real_labels,
+                        is_advgan=True
+                    )
 
                     # if LOSS.apply_r1_reg is True,
                     # let real images require gradient calculation to compute \derv_{x}Dis(x)
@@ -270,8 +275,9 @@ class WORKER(object):
                         real_images.requires_grad_(True)
 
                     # apply differentiable augmentations if "apply_diffaug" or "apply_ada" is True
-                    real_images_ = self.AUG.series_augment(real_images)
-                    fake_images_ = self.AUG.series_augment(fake_images)
+                    fake_images = noise + real_images_
+                    fake_images_ = fake_images
+                    #fake_images_ = self.AUG.series_augment(fake_images)
 
                     # calculate adv_output, embed, proxy, and cls_output using the discriminator
                     real_dict = self.Dis(real_images_, real_labels)
@@ -458,18 +464,20 @@ class WORKER(object):
         misc.toggle_grad(model=self.Gen, grad=True, num_freeze_layers=-1, is_stylegan=self.is_stylegan)
         self.Gen.apply(misc.track_bn_statistics)
         a = 0
+        real_image_basket, real_label_basket = self.sample_data_basket()
+        thr_list = np.array([0.5, 0.5, 0.27358491, 0.5, 0.14695946, 0.5, 0.14123377, 0.1, 0.5])
+        label_to_thr = torch.Tensor(thr_list).to(self.local_rank)
         for step_index in range(self.OPTIMIZATION.g_updates_per_step):
             self.OPTIMIZATION.g_optimizer.zero_grad()
             for acml_step in range(self.OPTIMIZATION.acml_steps):
                 with torch.cuda.amp.autocast() if self.RUN.mixed_precision and not self.is_stylegan else misc.dummy_context_mgr() as mpc:
                     #sample real images
-                    real_image_basket, real_label_basket = self.sample_data_basket()
                     real_images = real_image_basket[0].to(self.local_rank, non_blocking=True)
                     real_labels = real_label_basket[0].to(self.local_rank, non_blocking=True)
                     real_images_ = self.AUG.series_augment(real_images)
 
                     # sample fake images and labels from p(G(z), y)
-                    fake_images, fake_labels, fake_images_eps, trsp_cost, ws = sample.generate_images(
+                    noise, fake_labels, fake_images_eps, trsp_cost, ws = sample.generate_images(
                         z_prior=self.MODEL.z_prior,
                         truncation_factor=-1.0,
                         batch_size=self.OPTIMIZATION.batch_size,
@@ -494,12 +502,20 @@ class WORKER(object):
                     )
 
                     # apply differentiable augmentations if "apply_diffaug" is True
-                    fake_images_ = self.AUG.series_augment(fake_images)
+                    fake_images = real_images_ + noise
+                    fake_images_ = fake_images
+                    #fake_images_ = self.AUG.series_augment(fake_images)
 
-                    gen_acml_loss = self.l2_loss(fake_images_, torch.zeros_like(fake_images_))
+                    thr = label_to_thr[real_labels][:, None, None, None]
+                    #thr = 0.1
+                    amplitude_loss = ((torch.max(torch.abs(noise) - thr, torch.zeros_like(noise))) ** 2).sum()
+                    gen_acml_loss = amplitude_loss
+                    #thr = 50. * real_images.shape[0] * real_images.shape[1]
+                    #gen_acml_loss = torch.max(torch.zeros(1, device=self.local_rank), (noise ** 2).sum() - thr)
+                    #gen_acml_loss = self.l2_loss(fake_images_, torch.zeros_like(fake_images_))
 
                     # calculate adv_output, embed, proxy, and cls_output using the discriminator
-                    fake_dict = self.Dis(fake_images_ + real_images_, fake_labels)
+                    fake_dict = self.Dis(fake_images_, fake_labels)
 
                     if self.AUG.apply_ada:
                         # accumulate discriminator output informations for logging
@@ -523,8 +539,13 @@ class WORKER(object):
                     # add attack loss
                     #target_attack_logits = self.target_model(fake_images_)
                     #target_attack_logits = self.target_model(self.sr_module(fake_images_ + real_images_))
-                    target_attack_logits = self.target_model(self.resize(fake_images_ + real_images_))
-                    gen_acml_loss += self.ce_loss(target_attack_logits, (real_labels + 1) % 10)
+                    target_attack_logits = self.target_model(fake_images_)
+                    if (current_step + 1) % self.cfgs.RUN.print_every == 0:
+                        self.logger.info('')
+                        _, preds = torch.max(target_attack_logits, 1)
+                        self.logger.info(f'target classifier accuracy: {((preds == real_labels).sum() / preds.shape[0]).item() * 100:.2f}')
+                        self.logger.info(f'noise max: {noise.max()}, noise min: {noise.min()}, amplitude: {amplitude_loss}, thr: {thr_list.tolist()}')
+                    gen_acml_loss += 10 / self.ce_loss(target_attack_logits, real_labels)
 
                     # calculate class conditioning loss defined by "MODEL.d_cond_mtd"
                     if self.MODEL.d_cond_mtd in self.MISC.classifier_based_GAN:
@@ -534,7 +555,7 @@ class WORKER(object):
                             tac_gen_loss = -self.cond_loss_mi(**fake_dict)
                             gen_acml_loss += self.LOSS.tac_gen_lambda * tac_gen_loss
                         elif self.MODEL.aux_cls_type == "ADC":
-                            adc_fake_dict = self.Dis(fake_images_ + real_images_, fake_labels, adc_fake=self.adc_fake)
+                            adc_fake_dict = self.Dis(fake_images_, fake_labels, adc_fake=self.adc_fake)
                             adc_fake_cond_loss = -self.cond_loss(**adc_fake_dict)
                             gen_acml_loss += self.LOSS.cond_lambda * adc_fake_cond_loss
                         pass
@@ -688,6 +709,11 @@ class WORKER(object):
         with torch.no_grad() if not requires_grad else misc.dummy_context_mgr() as ctx:
             misc.make_GAN_untrainable(self.Gen, self.Gen_ema, self.Dis)
             generator, generator_mapping, generator_synthesis = self.gen_ctlr.prepare_generator()
+            
+            real_image_basket, real_label_basket = self.sample_data_basket()
+            real_images = real_image_basket[0].to(self.local_rank, non_blocking=True)
+            real_labels = real_label_basket[0].to(self.local_rank, non_blocking=True)
+            real_images_ = self.AUG.series_augment(real_images)
 
             fake_images, fake_labels, _, _, _ = sample.generate_images(z_prior=self.MODEL.z_prior,
                                                                        truncation_factor=self.RUN.truncation_factor,
@@ -706,9 +732,16 @@ class WORKER(object):
                                                                        generator_mapping=generator_mapping,
                                                                        generator_synthesis=generator_synthesis,
                                                                        style_mixing_p=0.0,
-                                                                       cal_trsp_cost=False)
+                                                                       cal_trsp_cost=False,
+                                                                       real_images=real_images_,
+                                                                       real_labels=real_labels,
+                                                                       is_advgan=True
+                                                                      )
 
-        misc.plot_img_canvas(images=(fake_images.detach().cpu() + 1) / 2,
+        normed_noise = fake_images.detach().cpu()
+        normed_noise -= normed_noise.min()
+        normed_noise /= (normed_noise.max() + 0.0001)
+        misc.plot_img_canvas(images=normed_noise,#(fake_images.detach().cpu() + 1) / 2,
                              save_path=join(self.RUN.save_dir,
                                             "figures/{run_name}/generated_canvas_{step}.png".format(run_name=self.run_name,
                                                                                                     step=current_step)),
@@ -716,7 +749,7 @@ class WORKER(object):
                              logger=self.logger,
                              logging=self.global_rank == 0 and self.logger)
 
-        wandb.log({"generated_images": wandb.Image(fake_images)}, step=self.wandb_step)
+        wandb.log({"generated_images": wandb.Image(normed_noise)}, step=self.wandb_step)
 
         misc.make_GAN_trainable(self.Gen, self.Gen_ema, self.Dis)
 
@@ -909,6 +942,11 @@ class WORKER(object):
         with torch.no_grad() if not requires_grad else misc.dummy_context_mgr() as ctx:
             misc.make_GAN_untrainable(self.Gen, self.Gen_ema, self.Dis)
             generator, generator_mapping, generator_synthesis = self.gen_ctlr.prepare_generator()
+            
+            real_image_basket, real_label_basket = self.sample_data_basket()
+            real_images = real_image_basket[0].to(self.local_rank, non_blocking=True)
+            real_labels = real_label_basket[0].to(self.local_rank, non_blocking=True)
+            real_images_ = self.AUG.series_augment(real_images)
 
             if png:
                 misc.save_images_png(data_loader=self.eval_dataloader,
@@ -929,7 +967,11 @@ class WORKER(object):
                                      generator_synthesis=generator_synthesis,
                                      directory=join(self.RUN.save_dir, "samples", self.run_name),
                                      device=self.local_rank,
-                                     sr_module=self.sr_module)
+                                     sr_module=self.sr_module,
+                                     real_images=real_images,
+                                     real_labels=real_labels,
+                                     is_advgan=True
+                                    )
             if npz:
                 misc.save_images_npz(data_loader=self.eval_dataloader,
                                      generator=generator,

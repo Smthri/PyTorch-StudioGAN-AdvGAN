@@ -98,7 +98,7 @@ def generate_images(z_prior, truncation_factor, batch_size, z_dim, num_classes, 
             else:
                 assert 0 <= truncation_factor, "truncation_factor must lie btw 0(strong truncation) ~ inf(no truncation)"
 
-    if is_advgan:
+    if not is_advgan:
         zs, fake_labels, zs_eps = sample_zy(z_prior=z_prior,
                                             batch_size=batch_size,
                                             z_dim=z_dim,
@@ -110,6 +110,7 @@ def generate_images(z_prior, truncation_factor, batch_size, z_dim, num_classes, 
     else:
         fake_labels = real_labels
         zs = real_images
+        zs_eps = None
 
     trsp_cost = None
     if LOSS.apply_lo:

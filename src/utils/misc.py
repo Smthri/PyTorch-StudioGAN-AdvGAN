@@ -545,7 +545,7 @@ def save_images_npz(data_loader, generator, discriminator, is_generate, num_imag
 
 def save_images_png(data_loader, generator, discriminator, is_generate, num_images, y_sampler, batch_size, z_prior,
                     truncation_factor, z_dim, num_classes, LOSS, RUN, is_stylegan, generator_mapping, generator_synthesis,
-                    directory, device, sr_module=None):
+                    directory, device, real_images, real_labels, is_advgan):
     num_batches = math.ceil(float(num_images) / float(batch_size))
     if is_generate:
         image_type = "fake"
@@ -584,9 +584,11 @@ def save_images_png(data_loader, generator, discriminator, is_generate, num_imag
                                                                  generator_synthesis=generator_synthesis,
                                                                  style_mixing_p=0.0,
                                                                  device=device,
-                                                                 cal_trsp_cost=False)
-                if sr_module is not None:
-                    images = sr_module(images)
+                                                                 cal_trsp_cost=False,
+                                                                 real_images=real_images,
+                                                                 real_labels=real_labels,
+                                                                 is_advgan=is_advgan
+                                                                )
             else:
                 try:
                     images, labels = next(data_iter)

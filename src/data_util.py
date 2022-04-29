@@ -80,7 +80,7 @@ class Dataset_(Dataset):
         if self.random_flip:
             self.trsf_list += [transforms.RandomHorizontalFlip()]
 
-        self.trsf_list += [transforms.ToTensor(), transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])]
+        self.trsf_list += [transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]#transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])]
         self.trsf = transforms.Compose(self.trsf_list)
 
         self.load_dataset()

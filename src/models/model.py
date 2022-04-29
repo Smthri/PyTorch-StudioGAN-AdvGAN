@@ -66,6 +66,7 @@ def load_generator_discriminator(DATA, OPTIMIZATION, MODEL, STYLEGAN2, MODULES, 
                                mapping_kwargs={"num_layers": STYLEGAN2.mapping_network},
                                synthesis_kwargs={"channel_base": channel_base, "channel_max": 512, \
                                "num_fp16_res": num_fp16_res, "conv_clamp": conv_clamp,}).to(device)
+        Gen = Gen.to(device)
 
         Gen_mapping, Gen_synthesis = Gen.mapping, Gen.synthesis
 
@@ -116,7 +117,8 @@ def load_generator_discriminator(DATA, OPTIMIZATION, MODEL, STYLEGAN2, MODULES, 
                                g_init=MODEL.g_init,
                                g_depth=MODEL.g_depth,
                                mixed_precision=RUN.mixed_precision,
-                               MODULES=MODULES).to(device)
+                               MODULES=MODULES)
+        Gen = Gen.to(device)
 
         Gen_mapping, Gen_synthesis = None, None
 

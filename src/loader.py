@@ -181,15 +181,16 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
     # -----------------------------------------------------------------------------
     # Load an adversarial target discriminator
     # -----------------------------------------------------------------------------
-    target_model_path = '/home/n.lokshin/lokshin/classification/checkpoints/stylegan_100.pth'
+    target_model_path = '/home/niki/Desktop/classification/checkpoints/stylegan_100.pth'
     AdvDis = model.load_target_model(target_model_path, local_rank, logger)
 
     # -----------------------------------------------------------------------------
     # Load the SR module
     # -----------------------------------------------------------------------------
-    sr_module_path = '/home/n.lokshin/lokshin/SRGAN/epochs/netG_epoch_2_35.pth'
-    sr_module = model.load_sr_module(sr_module_path, local_rank, logger)
-
+    #sr_module_path = '/home/n.lokshin/lokshin/SRGAN/epochs/netG_epoch_2_35.pth'
+    #sr_module = model.load_sr_module(sr_module_path, local_rank, logger)
+    sr_module = None
+    
     if local_rank != 0:
         custom_ops.verbosity = "none"
 
@@ -299,6 +300,9 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
         target_model=AdvDis,
         sr_module=sr_module
     )
+    #path = '/home/niki/Desktop/classification/adv_generator.pth'
+    #torch.save(Gen.state_dict(), path)
+    #logger.info(f'Saved generator to {path}')
 
     # -----------------------------------------------------------------------------
     # train GAN until "total_setps" generator updates
@@ -320,6 +324,9 @@ def load_worker(local_rank, cfgs, gpus_per_node, run_name, hdf5_path):
                                             real_cond_loss=real_cond_loss,
                                             gen_acml_loss=gen_acml_loss,
                                             dis_acml_loss=dis_acml_loss)
+                path = '/home/niki/Desktop/studiogan/adv_generator.pth'
+                torch.save(Gen.state_dict(), path)
+                logger.info(f'Saved generator to {path}')
             step += 1
 
             if cfgs.LOSS.apply_topk:
